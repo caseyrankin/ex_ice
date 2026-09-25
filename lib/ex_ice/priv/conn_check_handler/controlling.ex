@@ -54,7 +54,9 @@ defmodule ExICE.Priv.ConnCheckHandler.Controlling do
 
             put_in(ice_agent.checklist[r_pair.id], r_pair)
 
-          checklist_pair.state == :failed and ice_agent.state == :completed ->
+          # a pair whose consent expired is not re-scheduled either, see RFC 7675, sec. 5.1
+          checklist_pair.state == :failed and
+              (ice_agent.state == :completed or checklist_pair.consent_expired?) ->
             r_pair = resolve_pair(ice_agent, checklist_pair)
 
             r_pair = %{

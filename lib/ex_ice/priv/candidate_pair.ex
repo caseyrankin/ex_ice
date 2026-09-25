@@ -3,8 +3,13 @@ defmodule ExICE.Priv.CandidatePair do
 
   alias ExICE.Priv.{Candidate, Utils}
 
-  # Tr timeout (keepalives) in ms
+  # Tr timeout (keepalives, which are also consent checks) in ms.
+  # The actual interval is randomized, see keepalive_interval/1.
   @tr_timeout 5 * 1000
+
+  # Consent expiry in ms.
+  # See RFC 7675, sec. 5.1.
+  @consent_expiry 30 * 1000
 
   @type state() :: :waiting | :in_progress | :succeeded | :failed | :frozen
 
@@ -21,6 +26,8 @@ defmodule ExICE.Priv.CandidatePair do
           discovered_pair_id: integer() | nil,
           keepalive_timer: reference() | nil,
           last_seen: integer(),
+          last_consent: integer() | nil,
+          consent_expired?: boolean(),
           packets_sent: non_neg_integer(),
           packets_received: non_neg_integer(),
           bytes_sent: non_neg_integer(),
@@ -47,6 +54,13 @@ defmodule ExICE.Priv.CandidatePair do
                 # Time when this pair has received some data
                 # or sent conn check.
                 last_seen: nil,
+                # Time when this pair has received an authenticated,
+                # symmetric success response to our own binding request
+                # (consent to send, RFC 7675).
+                last_consent: nil,
+                # Whether this pair failed because its consent expired.
+                # Such a pair can't be used again until an ICE restart.
+                consent_expired?: false,
                 packets_sent: 0,
                 packets_received: 0,
                 bytes_sent: 0,
@@ -88,9 +102,33 @@ defmodule ExICE.Priv.CandidatePair do
   end
 
   def schedule_keepalive(pair, dest) do
-    ref = Process.send_after(dest, {:keepalive_timeout, pair.id}, @tr_timeout)
+    interval = keepalive_interval(:rand.uniform())
+    ref = Process.send_after(dest, {:keepalive_timeout, pair.id}, interval)
     %{pair | keepalive_timer: ref}
   end
+
+  # Keepalive interval for a draw from [0, 1): from 0.8 to 1.2 times Tr.
+  # See RFC 7675, sec. 5.1.
+  @doc false
+  @spec keepalive_interval(float()) :: pos_integer()
+  def keepalive_interval(draw) do
+    round(@tr_timeout * (0.8 + 0.4 * draw))
+  end
+
+  # Whether the pair's consent, if it has any, has expired at `now`.
+  @doc false
+  @spec consent_timed_out?(t(), integer()) :: boolean()
+  def consent_timed_out?(%__MODULE__{last_consent: nil}, _now), do: false
+
+  def consent_timed_out?(%__MODULE__{last_consent: last_consent}, now),
+    do: timed_out?(last_consent, now)
+
+  # Whether a response to a keepalive sent at `sent_at` can no longer grant consent at `now`.
+  @doc false
+  @spec check_timed_out?(integer(), integer()) :: boolean()
+  def check_timed_out?(sent_at, now), do: timed_out?(sent_at, now)
+
+  defp timed_out?(time, now), do: now - time >= @consent_expiry
 
   @doc false
   @spec recompute_priority(t(), integer(), integer(), ExICE.ICEAgent.role()) :: t()

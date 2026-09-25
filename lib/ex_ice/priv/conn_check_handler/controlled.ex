@@ -42,7 +42,9 @@ defmodule ExICE.Priv.ConnCheckHandler.Controlled do
 
             put_in(ice_agent.checklist[r_pair.id], r_pair)
 
-          checklist_pair.state == :failed and ice_agent.state == :completed ->
+          # a pair whose consent expired is not re-scheduled either, see RFC 7675, sec. 5.1
+          checklist_pair.state == :failed and
+              (ice_agent.state == :completed or checklist_pair.consent_expired?) ->
             r_pair = resolve_pair(ice_agent, checklist_pair)
 
             r_pair = %{
@@ -123,7 +125,7 @@ defmodule ExICE.Priv.ConnCheckHandler.Controlled do
         end
         |> ICEAgent.send_binding_success_response(discovered_pair, msg)
 
-      %CandidatePair{state: :failed} = checklist_pair
+      %CandidatePair{state: :failed, consent_expired?: false} = checklist_pair
       when ice_agent.state not in [:completed, :failed] ->
         r_pair = resolve_pair(ice_agent, checklist_pair)
 
@@ -144,7 +146,9 @@ defmodule ExICE.Priv.ConnCheckHandler.Controlled do
         ice_agent = put_in(ice_agent.checklist[r_pair.id], r_pair)
         ICEAgent.send_binding_success_response(ice_agent, r_pair, msg)
 
-      %CandidatePair{} = checklist_pair when ice_agent.state not in [:completed, :failed] ->
+      # a pair whose consent expired falls through to the last clause, see RFC 7675, sec. 5.1
+      %CandidatePair{consent_expired?: false} = checklist_pair
+      when ice_agent.state not in [:completed, :failed] ->
         Logger.debug("""
         Nomination request on pair that hasn't been verified yet.
         We will nominate pair once conn check passes.

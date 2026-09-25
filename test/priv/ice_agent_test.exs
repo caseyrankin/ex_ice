@@ -652,6 +652,7 @@ defmodule ExICE.Priv.ICEAgentTest do
 
       [new_pair] = Map.values(ice_agent.checklist)
       assert new_pair.last_seen > pair.last_seen
+      assert new_pair.last_consent > pair.last_consent
       assert new_pair.responses_received == pair.responses_received + 1
     end
 
@@ -684,6 +685,7 @@ defmodule ExICE.Priv.ICEAgentTest do
 
       [new_pair] = Map.values(ice_agent.checklist)
       assert new_pair.last_seen == pair.last_seen
+      assert new_pair.last_consent == pair.last_consent
       assert new_pair.responses_received == pair.responses_received + 1
     end
 
@@ -716,6 +718,7 @@ defmodule ExICE.Priv.ICEAgentTest do
 
       [new_pair] = Map.values(ice_agent.checklist)
       assert new_pair.last_seen == pair.last_seen
+      assert new_pair.last_consent == pair.last_consent
       assert new_pair.responses_received == pair.responses_received
 
       assert new_pair.non_symmetric_responses_received ==
@@ -748,6 +751,7 @@ defmodule ExICE.Priv.ICEAgentTest do
 
       [new_pair] = Map.values(ice_agent.checklist)
       assert new_pair.last_seen == pair.last_seen
+      assert new_pair.last_consent == pair.last_consent
       assert new_pair.responses_received == pair.responses_received + 1
     end
 
@@ -2128,48 +2132,411 @@ defmodule ExICE.Priv.ICEAgentTest do
     end
   end
 
-  test "pair timeout" do
-    # 1. make ice agent connected
-    # 2. mock the time a pair has received something from the peer
-    # 3. trigger pair timeout
-    # 4. assert that the pair has been marked as failed
-    # 5. trigger eoc timeout and assert that ice agent moved to the failed state
+  describe "consent freshness" do
+    setup do
+      ice_agent =
+        :controlling
+        |> new_ice_agent()
+        |> ICEAgent.add_remote_candidate(@remote_cand)
 
-    ice_agent =
+      %{ice_agent: ice_agent}
+    end
+
+    test "consent expiry", %{ice_agent: ice_agent} do
+      # 1. make ice agent connected
+      # 2. mock the time the pair last got consent, 30 s ago
+      # 3. feed data: data alone keeps no consent
+      # 4. trigger pair timeout and assert that the pair has been marked as failed
+      # 5. trigger eoc timeout and assert that ice agent moved to the failed state
+
+      # Make sure we are not gathering local candidates.
+      # That's important for moving to the failed state later on.
+      assert ice_agent.gathering_state == :complete
+
+      ice_agent = connect(ice_agent)
+      [socket] = ice_agent.sockets
+
+      [pair] = Map.values(ice_agent.checklist)
+      ice_agent = put_in(ice_agent.checklist[pair.id], Map.put(pair, :last_consent, ago(30_001)))
+
+      ice_agent =
+        ICEAgent.handle_udp(ice_agent, socket, @remote_cand.address, @remote_cand.port, "data")
+
+      ice_agent = ICEAgent.handle_pair_timeout(ice_agent)
+
+      assert [%CandidatePair{state: :failed, valid?: false} = pair] =
+               Map.values(ice_agent.checklist)
+
+      assert pair.consent_expired?
+
+      ice_agent = ICEAgent.handle_eoc_timeout(ice_agent)
+      assert ice_agent.state == :failed
+    end
+
+    test "a pair survives without inbound packets while its consent is fresh", %{
+      ice_agent: ice_agent
+    } do
+      ice_agent = connect(ice_agent)
+
+      [pair] = Map.values(ice_agent.checklist)
+      pair = pair |> Map.put(:last_seen, ago(10_000)) |> Map.put(:last_consent, ago(10_000))
+      ice_agent = put_in(ice_agent.checklist[pair.id], pair)
+
+      ice_agent = ICEAgent.handle_pair_timeout(ice_agent)
+
+      assert [%CandidatePair{state: :succeeded, valid?: true}] = Map.values(ice_agent.checklist)
+      assert ice_agent.state == :connected
+    end
+
+    test "a response to a check sent 30 s ago refreshes no consent", %{ice_agent: ice_agent} do
+      ice_agent = connect(ice_agent)
+      [socket] = ice_agent.sockets
+      [pair] = Map.values(ice_agent.checklist)
+
+      ice_agent = ICEAgent.handle_keepalive_timeout(ice_agent, pair.id)
+      req = read_binding_request(socket, ice_agent.remote_pwd)
+
+      # mock the time the check was sent
+      {pair_id, sent_at} = Map.fetch!(ice_agent.keepalives, req.transaction_id)
+      ice_agent = put_in(ice_agent.keepalives[req.transaction_id], {pair_id, sent_at - 30_001})
+
+      # wait so there will be a change in last_consent if something went wrong
+      Process.sleep(1)
+      ice_agent = respond(ice_agent, req, @remote_cand)
+
+      [new_pair] = Map.values(ice_agent.checklist)
+      assert new_pair.state == :succeeded
+      assert new_pair.last_consent == pair.last_consent
+      assert ice_agent.keepalives == %{}
+    end
+
+    test "stale and expired checks are dropped" do
+      {ice_agent, high_pair, low_pair} = two_valid_pairs(:controlling)
+
+      ice_agent = ICEAgent.handle_keepalive_timeout(ice_agent, high_pair.id)
+      ice_agent = ICEAgent.handle_keepalive_timeout(ice_agent, high_pair.id)
+      ice_agent = ICEAgent.handle_keepalive_timeout(ice_agent, low_pair.id)
+
+      [stale, high_fresh, low_fresh] =
+        Enum.sort_by(ice_agent.keepalives, fn {_t_id, {pair_id, sent_at}} ->
+          {pair_id != high_pair.id, sent_at}
+        end)
+
+      # mock the time the first check on the high pair was sent
+      {stale_t_id, {pair_id, sent_at}} = stale
+      ice_agent = put_in(ice_agent.keepalives[stale_t_id], {pair_id, sent_at - 30_001})
+
+      ice_agent = ICEAgent.handle_pair_timeout(ice_agent)
+      assert ice_agent.keepalives == Map.new([high_fresh, low_fresh])
+
+      ice_agent = expire(ice_agent, high_pair.id)
+      ice_agent = ICEAgent.handle_pair_timeout(ice_agent)
+      assert ice_agent.state == :connected
+      assert ice_agent.keepalives == Map.new([low_fresh])
+    end
+
+    test "expiry from connected fails ICE only with the last valid pair" do
+      {ice_agent, high_pair, low_pair} = two_valid_pairs(:controlling)
+      assert ice_agent.gathering_state == :complete
+
+      ice_agent = expire(ice_agent, high_pair.id)
+      ice_agent = ICEAgent.handle_pair_timeout(ice_agent)
+
+      assert %CandidatePair{state: :failed} = Map.fetch!(ice_agent.checklist, high_pair.id)
+      assert %CandidatePair{state: :succeeded} = Map.fetch!(ice_agent.checklist, low_pair.id)
+      assert ice_agent.state == :connected
+
+      # data goes out on the pair that still has consent
+      ice_agent = ICEAgent.send_data(ice_agent, "data")
+
+      assert Map.fetch!(ice_agent.checklist, low_pair.id).packets_sent ==
+               low_pair.packets_sent + 1
+
+      assert Map.fetch!(ice_agent.checklist, high_pair.id).packets_sent == high_pair.packets_sent
+
+      ice_agent = expire(ice_agent, low_pair.id)
+      ice_agent = ICEAgent.handle_pair_timeout(ice_agent)
+      assert %CandidatePair{state: :failed} = Map.fetch!(ice_agent.checklist, low_pair.id)
+
+      ice_agent = ICEAgent.handle_eoc_timeout(ice_agent)
+      assert ice_agent.state == :failed
+    end
+
+    test "consent expires at 30 000 ms without a tick", %{ice_agent: ice_agent} do
+      ice_agent = connect(ice_agent)
+      [socket] = ice_agent.sockets
+      [pair] = Map.values(ice_agent.checklist)
+
+      # 100 ms under the expiry: the agent reads its clock after the test does
+      old_consent = ago(29_900)
+      ice_agent = put_in(ice_agent.checklist[pair.id], Map.put(pair, :last_consent, old_consent))
+      ice_agent = ICEAgent.handle_keepalive_timeout(ice_agent, pair.id)
+      req = read_binding_request(socket, ice_agent.remote_pwd)
+      renewed = respond(ice_agent, req, @remote_cand)
+
+      assert [%CandidatePair{state: :succeeded} = renewed_pair] = Map.values(renewed.checklist)
+      assert renewed_pair.last_consent > old_consent
+
+      for age <- [30_000, 30_001] do
+        ice_agent = put_in(ice_agent.checklist[pair.id], Map.put(pair, :last_consent, ago(age)))
+        ice_agent = ICEAgent.handle_keepalive_timeout(ice_agent, pair.id)
+        req = read_binding_request(socket, ice_agent.remote_pwd)
+        expired = respond(ice_agent, req, @remote_cand)
+
+        assert [%CandidatePair{state: :failed, consent_expired?: true}] =
+                 Map.values(expired.checklist)
+
+        assert expired.keepalives == %{}
+      end
+
+      # data on a selected pair whose consent expired expires it and is not sent
+      pair = Map.put(pair, :last_consent, ago(30_000))
+      ice_agent = put_in(ice_agent.checklist[pair.id], pair)
+      ice_agent = %{ice_agent | state: :completed, selected_pair_id: pair.id}
+
+      ice_agent = ICEAgent.send_data(ice_agent, "data")
+
+      assert Transport.Mock.recv(socket) == nil
+      assert [%CandidatePair{state: :failed, packets_sent: 0}] = Map.values(ice_agent.checklist)
+      assert ice_agent.state == :failed
+    end
+
+    test "a pair whose nomination is in flight expires too" do
+      for trigger <- [:tick, :response] do
+        ice_agent =
+          :controlling
+          |> new_ice_agent()
+          |> ICEAgent.add_remote_candidate(@remote_cand)
+          |> connect()
+
+        [socket] = ice_agent.sockets
+        [pair] = Map.values(ice_agent.checklist)
+
+        # end-of-candidates starts the nomination, a conn check on the valid pair
+        ice_agent = ICEAgent.end_of_candidates(ice_agent)
+        assert ice_agent.nominating? == {true, pair.id}
+        req = read_binding_request(socket, ice_agent.remote_pwd)
+        ice_agent = expire(ice_agent, pair.id)
+
+        ice_agent =
+          case trigger do
+            :tick -> ICEAgent.handle_pair_timeout(ice_agent)
+            :response -> respond(ice_agent, req, @remote_cand)
+          end
+
+        assert [%CandidatePair{state: :failed, consent_expired?: true}] =
+                 Map.values(ice_agent.checklist)
+
+        assert ice_agent.selected_pair_id == nil
+        assert ice_agent.state == :failed
+      end
+    end
+
+    test "an expired pair's conn checks are dropped with it" do
+      {ice_agent, high_pair, low_pair} = two_valid_pairs(:controlling)
+      [socket] = ice_agent.sockets
+      ice_agent = %{ice_agent | tiebreaker: 100}
+
+      # end-of-candidates starts the nomination of the high pair
+      ice_agent = ICEAgent.end_of_candidates(ice_agent)
+      assert ice_agent.nominating? == {true, high_pair.id}
+      req = read_binding_request(socket, ice_agent.remote_pwd)
+
+      # the peer wins a role conflict, so the nominated pair's failure no longer fails ICE
+      conflict =
+        Message.new(%Type{class: :request, method: :binding}, [
+          %Username{value: "#{ice_agent.local_ufrag}:someufrag"},
+          %Priority{priority: 1234},
+          %ICEControlling{tiebreaker: ice_agent.tiebreaker + 1}
+        ])
+        |> Message.with_integrity(ice_agent.local_pwd)
+        |> Message.with_fingerprint()
+        |> Message.encode()
+
+      low_cand = Map.fetch!(ice_agent.remote_cands, low_pair.remote_cand_id)
+
+      ice_agent =
+        ICEAgent.handle_udp(ice_agent, socket, low_cand.address, low_cand.port, conflict)
+
+      assert ice_agent.role == :controlled
+      drain_packets(socket)
+
+      ice_agent = ice_agent |> expire(high_pair.id) |> ICEAgent.handle_pair_timeout()
+      assert ice_agent.state == :connected
+      assert ice_agent.conn_checks == %{}
+      refute req.transaction_id in ice_agent.tr_rtx
+
+      # a late response to the nomination is ignored
+      high_cand = Map.fetch!(ice_agent.remote_cands, high_pair.remote_cand_id)
+      ice_agent = respond(ice_agent, req, high_cand)
+      assert %CandidatePair{state: :failed} = Map.fetch!(ice_agent.checklist, high_pair.id)
+      assert ice_agent.state == :connected
+    end
+
+    test "a pair that failed otherwise cannot regain consent after it expired" do
+      for tick? <- [true, false] do
+        {ice_agent, high_pair, _low_pair} = two_valid_pairs(:controlled)
+        [socket] = ice_agent.sockets
+        remote_cand = Map.fetch!(ice_agent.remote_cands, high_pair.remote_cand_id)
+
+        # the pair fails for another reason (e.g. its nomination timed out), then its consent
+        # expires, with or without a tick noticing it
+        high_pair = Map.fetch!(ice_agent.checklist, high_pair.id)
+
+        high_pair =
+          Map.put(%{high_pair | state: :failed, valid?: false}, :last_consent, ago(30_001))
+
+        ice_agent = put_in(ice_agent.checklist[high_pair.id], high_pair)
+        ice_agent = if tick?, do: ICEAgent.handle_pair_timeout(ice_agent), else: ice_agent
+
+        # the peer nominates it and answers a check on it, if one goes out
+        req = peer_binding_request(ice_agent, true)
+
+        ice_agent =
+          ICEAgent.handle_udp(ice_agent, socket, remote_cand.address, remote_cand.port, req)
+
+        drain_packets(socket)
+        ice_agent = ICEAgent.handle_ta_timeout(ice_agent)
+
+        ice_agent =
+          case Transport.Mock.recv(socket) do
+            nil -> ice_agent
+            packet -> respond(ice_agent, elem(Message.decode(packet), 1), remote_cand)
+          end
+
+        assert %CandidatePair{state: :failed, consent_expired?: true} =
+                 Map.fetch!(ice_agent.checklist, high_pair.id),
+               "tick: #{tick?}"
+
+        assert ice_agent.selected_pair_id != high_pair.id
+      end
+    end
+
+    test "an expired pair is not revived" do
+      for {role, use_cand?} <- [controlling: false, controlled: false, controlled: true] do
+        {ice_agent, high_pair, low_pair} = two_valid_pairs(role)
+        [socket] = ice_agent.sockets
+        remote_cand = Map.fetch!(ice_agent.remote_cands, high_pair.remote_cand_id)
+
+        # no inbound packet for 30 s either, so the pair fails whatever times it out
+        high_pair = Map.fetch!(ice_agent.checklist, high_pair.id)
+
+        high_pair =
+          high_pair |> Map.put(:last_seen, ago(30_001)) |> Map.put(:last_consent, ago(30_001))
+
+        ice_agent = put_in(ice_agent.checklist[high_pair.id], high_pair)
+        ice_agent = ICEAgent.handle_pair_timeout(ice_agent)
+        assert %CandidatePair{state: :failed} = Map.fetch!(ice_agent.checklist, high_pair.id)
+        assert ice_agent.ta_timer == nil
+
+        req = peer_binding_request(ice_agent, use_cand?)
+
+        ice_agent =
+          ICEAgent.handle_udp(ice_agent, socket, remote_cand.address, remote_cand.port, req)
+
+        ice_agent =
+          ICEAgent.handle_udp(ice_agent, socket, remote_cand.address, remote_cand.port, "data")
+
+        assert %CandidatePair{state: :failed} = Map.fetch!(ice_agent.checklist, high_pair.id)
+        assert Transport.Mock.recv(socket) == nil
+        assert ice_agent.ta_timer == nil
+
+        # the other pair keeps working
+        assert ice_agent.state == :connected
+        ice_agent = ICEAgent.send_data(ice_agent, "data")
+
+        assert Map.fetch!(ice_agent.checklist, low_pair.id).packets_sent ==
+                 low_pair.packets_sent + 1
+      end
+    end
+
+    defp new_ice_agent(role) do
       ICEAgent.new(
         controlling_process: self(),
-        role: :controlling,
+        role: role,
         if_discovery_module: IfDiscovery.MockSingle,
         transport_module: Transport.Mock
       )
       |> ICEAgent.set_remote_credentials("someufrag", "somepwd")
       |> ICEAgent.gather_candidates()
-      |> ICEAgent.add_remote_candidate(@remote_cand)
+    end
 
-    # Make sure we are not gathering local candidates.
-    # That's important for moving to the failed state later on.
-    assert ice_agent.gathering_state == :complete
+    # A connected agent with two valid pairs, one per remote candidate.
+    defp two_valid_pairs(role) do
+      ice_agent =
+        role
+        |> new_ice_agent()
+        |> ICEAgent.add_remote_candidate(@remote_cand)
+        |> ICEAgent.add_remote_candidate(@remote_cand2)
 
-    # make ice_agent connected
-    ice_agent = connect(ice_agent)
+      [socket] = ice_agent.sockets
 
-    # mock last_seen field
-    [pair] = Map.values(ice_agent.checklist)
-    last_seen = System.monotonic_time(:millisecond) - 10_000
-    pair = %{pair | last_seen: last_seen}
-    ice_agent = put_in(ice_agent.checklist[pair.id], pair)
+      ice_agent =
+        Enum.reduce(1..2, ice_agent, fn _, ice_agent ->
+          ice_agent = ICEAgent.handle_ta_timeout(ice_agent)
+          req = read_binding_request(socket, ice_agent.remote_pwd)
+          %{pair_id: pair_id} = Map.fetch!(ice_agent.conn_checks, req.transaction_id)
+          pair = Map.fetch!(ice_agent.checklist, pair_id)
+          remote_cand = Map.fetch!(ice_agent.remote_cands, pair.remote_cand_id)
+          respond(ice_agent, req, remote_cand)
+        end)
 
-    # trigger pair timeout
-    ice_agent = ICEAgent.handle_pair_timeout(ice_agent)
+      # clear ta_timer
+      ice_agent = ICEAgent.handle_ta_timeout(ice_agent)
+      assert ice_agent.ta_timer == nil
+      assert ice_agent.state == :connected
 
-    # assert that the pair is marked as failed
-    assert [%CandidatePair{state: :failed, valid?: false}] = Map.values(ice_agent.checklist)
+      [low_pair, high_pair] =
+        ice_agent.checklist
+        |> Map.values()
+        |> Enum.sort_by(& &1.priority)
 
-    # trigger eoc timeout
-    ice_agent = ICEAgent.handle_eoc_timeout(ice_agent)
+      assert %CandidatePair{state: :succeeded, valid?: true} = low_pair
+      assert %CandidatePair{state: :succeeded, valid?: true} = high_pair
+      {ice_agent, high_pair, low_pair}
+    end
 
-    # assert ice agent moved to the failed state
-    assert ice_agent.state == :failed
+    # Mocks the time the pair last got consent, 30 s ago.
+    defp expire(ice_agent, pair_id) do
+      pair = Map.fetch!(ice_agent.checklist, pair_id)
+      put_in(ice_agent.checklist[pair_id], Map.put(pair, :last_consent, ago(30_001)))
+    end
+
+    defp respond(ice_agent, req, remote_cand) do
+      [socket] = ice_agent.sockets
+
+      resp =
+        binding_response(
+          req.transaction_id,
+          ice_agent.transport_module,
+          socket,
+          ice_agent.remote_pwd
+        )
+
+      ICEAgent.handle_udp(ice_agent, socket, remote_cand.address, remote_cand.port, resp)
+    end
+
+    # A binding request from the peer, which has the other role.
+    defp peer_binding_request(ice_agent, use_cand?) do
+      role_attr =
+        if ice_agent.role == :controlled,
+          do: %ICEControlling{tiebreaker: ice_agent.tiebreaker + 1},
+          else: %ICEControlled{tiebreaker: ice_agent.tiebreaker - 1}
+
+      attrs =
+        [
+          %Username{value: "#{ice_agent.local_ufrag}:someufrag"},
+          %Priority{priority: 1234},
+          role_attr
+        ] ++ if(use_cand?, do: [%UseCandidate{}], else: [])
+
+      Message.new(%Type{class: :request, method: :binding}, attrs)
+      |> Message.with_integrity(ice_agent.local_pwd)
+      |> Message.with_fingerprint()
+      |> Message.encode()
+    end
+
+    defp ago(ms), do: System.monotonic_time(:millisecond) - ms
   end
 
   test "agent state and behavior after it fails" do

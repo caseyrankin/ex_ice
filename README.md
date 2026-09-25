@@ -18,6 +18,9 @@ Implements:
 * supports host, prflx, srflx and relay candidates
 * transaction pacing
 * keepalives (both incoming and outgoing) on valid and selected pairs
+* consent freshness ([RFC 7675](https://datatracker.ietf.org/doc/html/rfc7675)) -
+keepalives are consent checks and a pair that gets no answer to them for 30 seconds fails
+(an authenticated 403 does not revoke consent at once, sec. 5.2)
 * mDNS client
 
 ## Limitations

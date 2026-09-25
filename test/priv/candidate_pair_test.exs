@@ -38,4 +38,24 @@ defmodule ExICE.Priv.CandidatePairTest do
 
     assert abs(c1c2.priority - c2c1.priority) == 1
   end
+
+  test "the keepalive interval spans 4-6 s" do
+    # RFC 7675, sec. 5.1: 0.8 to 1.2 times the 5 s base, never under 4 s
+    assert CandidatePair.keepalive_interval(0.0) == 4_000
+    assert CandidatePair.keepalive_interval(0.5) == 5_000
+    assert CandidatePair.keepalive_interval(0.9999) == 6_000
+
+    pair = %CandidatePair{id: 1, local_cand_id: 1, remote_cand_id: 2, priority: 1}
+
+    intervals =
+      for _ <- 1..100 do
+        %CandidatePair{keepalive_timer: timer} = CandidatePair.schedule_keepalive(pair)
+        interval = Process.read_timer(timer)
+        Process.cancel_timer(timer)
+        interval
+      end
+
+    assert Enum.all?(intervals, &(&1 in 3_900..6_000))
+    assert Enum.max(intervals) - Enum.min(intervals) > 1_000
+  end
 end

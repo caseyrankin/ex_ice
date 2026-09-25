@@ -29,10 +29,11 @@ defmodule ExICE.Priv.ICEAgent do
   # See appendix B.1.
   @hto 2_000
 
-  # Pair timeout in ms.
-  # If we don't receive any data in this time,
-  # a pair is marked as failed.
-  @pair_timeout 8_000
+  # Pair check interval in ms.
+  # This often, pairs whose consent expired are marked as failed
+  # and keepalives that can no longer grant consent are dropped.
+  # See RFC 7675, sec. 5.1.
+  @pair_check_interval 1_000
 
   # End-of-candidates timeout in ms.
   # If we don't receive end-of-candidates indication in this time,
@@ -515,6 +516,28 @@ defmodule ExICE.Priv.ICEAgent do
       Map.get(ice_agent.checklist, ice_agent.selected_pair_id) ||
         Checklist.get_valid_pair(ice_agent.checklist)
 
+    if CandidatePair.consent_timed_out?(pair, now()) do
+      # RFC 7675, sec. 5.1: stop sending on a pair without consent
+      Logger.debug("Consent expired on pair: #{pair.id}. Not sending data. Marking as failed.")
+
+      ice_agent
+      |> expire_pair(pair)
+      |> update_connection_state()
+    else
+      send_data_on_pair(ice_agent, pair, data)
+    end
+  end
+
+  def send_data(%__MODULE__{state: state} = ice_agent, _data) do
+    Logger.debug("""
+    Cannot send data in ICE state: #{inspect(state)}. \
+    Data can only be sent in state :connected or :completed. Ignoring.\
+    """)
+
+    ice_agent
+  end
+
+  defp send_data_on_pair(ice_agent, pair, data) do
     local_cand = Map.fetch!(ice_agent.local_cands, pair.local_cand_id)
     remote_cand = Map.fetch!(ice_agent.remote_cands, pair.remote_cand_id)
 
@@ -551,15 +574,6 @@ defmodule ExICE.Priv.ICEAgent do
 
         put_in(ice_agent.checklist[pair.id], pair)
     end
-  end
-
-  def send_data(%__MODULE__{state: state} = ice_agent, _data) do
-    Logger.debug("""
-    Cannot send data in ICE state: #{inspect(state)}. \
-    Data can only be sent in state :connected or :completed. Ignoring.\
-    """)
-
-    ice_agent
   end
 
   @spec restart(t()) :: t()
@@ -794,50 +808,84 @@ defmodule ExICE.Priv.ICEAgent do
 
   def handle_pair_timeout(ice_agent) do
     start_pair_timer()
+    now = now()
 
-    # only take final pairs i.e. those that are actually used
+    # take every pair that has had consent and hasn't lost it yet, valid or not
+    # (e.g. one whose nomination is in progress, or one that failed otherwise
+    # and could be checked again)
     pairs =
       ice_agent.checklist
       |> Map.values()
-      |> Stream.filter(fn pair -> pair.state == :succeeded end)
-      |> Enum.filter(fn pair -> pair.id == pair.discovered_pair_id end)
+      |> Enum.filter(fn pair -> pair.last_consent != nil and not pair.consent_expired? end)
 
-    timeout_pairs(ice_agent, pairs, now())
+    ice_agent
+    |> drop_stale_keepalives(now)
+    |> timeout_pairs(pairs, now)
     |> update_connection_state()
+  end
+
+  # A response to a keepalive sent 30 seconds ago or more can't grant consent.
+  # See RFC 7675, sec. 5.1.
+  defp drop_stale_keepalives(ice_agent, now) do
+    keepalives =
+      Map.reject(ice_agent.keepalives, fn {_t_id, {_pair_id, sent_at}} ->
+        CandidatePair.check_timed_out?(sent_at, now)
+      end)
+
+    %{ice_agent | keepalives: keepalives}
   end
 
   defp timeout_pairs(ice_agent, [], _now), do: ice_agent
 
-  defp timeout_pairs(ice_agent, [%{last_seen: nil} | pairs], now) do
-    timeout_pairs(ice_agent, pairs, now)
-  end
-
   defp timeout_pairs(ice_agent, [pair | pairs], now) do
-    diff = now - pair.last_seen
-
-    if diff >= @pair_timeout do
+    if CandidatePair.consent_timed_out?(pair, now) do
       Logger.debug("""
-      Pair: #{pair.id} didn't receive any data in #{diff}ms. \
+      Pair: #{pair.id} didn't receive consent in #{now - pair.last_consent}ms. \
       Marking as failed.\
       """)
 
-      checklist = Checklist.timeout_pairs(ice_agent.checklist, [pair.id, pair.succeeded_pair_id])
-      ice_agent = %{ice_agent | checklist: checklist}
-
-      ice_agent =
-        if ice_agent.selected_pair_id == pair.id do
-          %{
-            ice_agent
-            | selected_pair_id: nil,
-              selected_candidate_pair_changes: ice_agent.selected_candidate_pair_changes + 1
-          }
-        else
-          ice_agent
-        end
-
-      timeout_pairs(ice_agent, pairs, now)
+      ice_agent
+      |> expire_pair(pair)
+      |> timeout_pairs(pairs, now)
     else
       timeout_pairs(ice_agent, pairs, now)
+    end
+  end
+
+  # Marks a pair whose consent expired, and its succeeded pair, as failed
+  # and drops their outstanding transactions, e.g. a nomination
+  # (a response to a conn check on a failed pair would raise).
+  # Such pairs can't be used again until an ICE restart. See RFC 7675, sec. 5.1.
+  defp expire_pair(ice_agent, pair) do
+    ids = [pair.id, pair.succeeded_pair_id]
+
+    checklist =
+      Enum.reduce(ids, Checklist.timeout_pairs(ice_agent.checklist, ids), fn id, checklist ->
+        Map.replace_lazy(checklist, id, &%{&1 | consent_expired?: true})
+      end)
+
+    {expired_conn_checks, conn_checks} =
+      Map.split_with(ice_agent.conn_checks, fn {_, conn_check} -> conn_check.pair_id in ids end)
+
+    keepalives =
+      Map.reject(ice_agent.keepalives, fn {_t_id, {pair_id, _sent_at}} -> pair_id in ids end)
+
+    ice_agent = %{
+      ice_agent
+      | checklist: checklist,
+        conn_checks: conn_checks,
+        keepalives: keepalives,
+        tr_rtx: ice_agent.tr_rtx -- Map.keys(expired_conn_checks)
+    }
+
+    if ice_agent.selected_pair_id == pair.id do
+      %{
+        ice_agent
+        | selected_pair_id: nil,
+          selected_candidate_pair_changes: ice_agent.selected_candidate_pair_changes + 1
+      }
+    else
+      ice_agent
     end
   end
 
@@ -1451,6 +1499,11 @@ defmodule ExICE.Priv.ICEAgent do
     do_handle_data_message(ice_agent, pair, packet)
   end
 
+  defp handle_data_message(ice_agent, %{state: :failed, consent_expired?: true} = pair, packet) do
+    # a pair whose consent expired is not re-scheduled, see RFC 7675, sec. 5.1
+    do_handle_data_message(ice_agent, pair, packet)
+  end
+
   defp handle_data_message(ice_agent, %{state: :failed} = pair, packet) do
     Logger.debug("""
     Received data on failed pair. Rescheduling pair for conn check. Pair id: #{pair.id}\
@@ -1559,7 +1612,6 @@ defmodule ExICE.Priv.ICEAgent do
 
       %Type{class: class, method: :binding}
       when is_response(class) and is_map_key(ice_agent.keepalives, msg.transaction_id) ->
-        # TODO: this a good basis to implement consent freshness
         handle_keepalive_response(ice_agent, local_cand, src_ip, src_port, msg)
 
       %Type{class: class, method: :binding} when is_response(class) ->
@@ -1851,6 +1903,7 @@ defmodule ExICE.Priv.ICEAgent do
          msg
        ) do
     with :ok <- authenticate_msg(msg, ice_agent.remote_pwd),
+         :ok <- check_consent(ice_agent, conn_check_pair),
          {:ok, xor_addr} <- Message.get_attribute(msg, XORMappedAddress) do
       {local_cand, ice_agent} = get_or_create_local_cand(ice_agent, xor_addr, conn_check_pair)
       remote_cand = Map.fetch!(ice_agent.remote_cands, conn_check_pair.remote_cand_id)
@@ -1864,10 +1917,12 @@ defmodule ExICE.Priv.ICEAgent do
         add_valid_pair(ice_agent, valid_pair, conn_check_pair, checklist_pair)
 
       pair = CandidatePair.schedule_keepalive(ice_agent.checklist[pair_id])
+      now = now()
 
       pair = %{
         pair
-        | last_seen: now(),
+        | last_seen: now,
+          last_consent: now,
           responses_received: pair.responses_received + 1
       }
 
@@ -1882,6 +1937,13 @@ defmodule ExICE.Priv.ICEAgent do
       ice_agent = %{ice_agent | checklist: checklist}
       @conn_check_handler[ice_agent.role].update_nominated_flag(ice_agent, pair_id, nominate?)
     else
+      {:error, :consent_expired, discovered_pair} ->
+        Logger.debug(
+          "Consent expired on pair: #{discovered_pair.id} before the conn check response. Marking as failed."
+        )
+
+        expire_pair(ice_agent, discovered_pair)
+
       {:error, reason} ->
         Logger.debug("""
         Ignoring conn check response, reason: #{reason}. \
@@ -1895,6 +1957,20 @@ defmodule ExICE.Priv.ICEAgent do
         }
 
         put_in(ice_agent.checklist[conn_check_pair.id], conn_check_pair)
+    end
+  end
+
+  # A conn check on a pair that has had consent, e.g. its nomination,
+  # renews it only while it still has consent. See RFC 7675, sec. 5.1.
+  defp check_consent(_ice_agent, %CandidatePair{discovered_pair_id: nil}), do: :ok
+
+  defp check_consent(ice_agent, conn_check_pair) do
+    discovered_pair = Map.fetch!(ice_agent.checklist, conn_check_pair.discovered_pair_id)
+
+    if CandidatePair.consent_timed_out?(discovered_pair, now()) do
+      {:error, :consent_expired, discovered_pair}
+    else
+      :ok
     end
   end
 
@@ -2057,11 +2133,19 @@ defmodule ExICE.Priv.ICEAgent do
   end
 
   defp handle_keepalive_response(ice_agent, local_cand, src_ip, src_port, msg) do
-    {pair_id, ice_agent} = pop_in(ice_agent.keepalives[msg.transaction_id])
+    {{pair_id, sent_at}, ice_agent} = pop_in(ice_agent.keepalives[msg.transaction_id])
 
     case Map.fetch(ice_agent.checklist, pair_id) do
       {:ok, %CandidatePair{} = pair} ->
-        handle_keepalive_response_on_pair(ice_agent, local_cand, src_ip, src_port, msg, pair)
+        handle_keepalive_response_on_pair(
+          ice_agent,
+          local_cand,
+          src_ip,
+          src_port,
+          msg,
+          pair,
+          sent_at
+        )
 
       :error ->
         Logger.debug("Ignoring keepalive response for pruned pair #{inspect(pair_id)}")
@@ -2075,19 +2159,22 @@ defmodule ExICE.Priv.ICEAgent do
          src_ip,
          src_port,
          %Message{type: %Type{class: :success_response}} = msg,
-         pair
+         pair,
+         sent_at
        ) do
     with true <- symmetric?(ice_agent, local_cand.base.socket, {src_ip, src_port}, pair),
          :ok <- authenticate_msg(msg, ice_agent.remote_pwd) do
       Logger.debug("Received keepalive success response on: #{pair_info(ice_agent, pair)}")
+      now = now()
 
       pair = %{
         pair
-        | last_seen: now(),
+        | last_seen: now,
           responses_received: pair.responses_received + 1
       }
 
-      put_in(ice_agent.checklist[pair.id], pair)
+      ice_agent = put_in(ice_agent.checklist[pair.id], pair)
+      renew_consent(ice_agent, pair, sent_at, now)
     else
       false ->
         ka_local_cand = Map.fetch!(ice_agent.local_cands, pair.local_cand_id)
@@ -2127,7 +2214,8 @@ defmodule ExICE.Priv.ICEAgent do
          src_ip,
          src_port,
          %Message{type: %Type{class: :error_response}},
-         pair
+         pair,
+         _sent_at
        ) do
     pair = %{pair | responses_received: pair.responses_received + 1}
     ice_agent = put_in(ice_agent.checklist[pair.id], pair)
@@ -2140,6 +2228,27 @@ defmodule ExICE.Priv.ICEAgent do
     """)
 
     ice_agent
+  end
+
+  # A success response to a keepalive grants consent for another 30 seconds,
+  # provided the pair still has consent and the keepalive was sent less than 30 seconds ago.
+  # See RFC 7675, sec. 5.1.
+  defp renew_consent(ice_agent, pair, sent_at, now) do
+    cond do
+      CandidatePair.consent_timed_out?(pair, now) ->
+        Logger.debug(
+          "Consent expired on pair: #{pair.id} before the response. Marking as failed."
+        )
+
+        expire_pair(ice_agent, pair)
+
+      CandidatePair.check_timed_out?(sent_at, now) ->
+        Logger.debug("Keepalive response too late to renew consent on pair: #{pair.id}.")
+        ice_agent
+
+      true ->
+        put_in(ice_agent.checklist[pair.id], %{pair | last_consent: now})
+    end
   end
 
   # Adds valid pair according to sec 7.2.5.3.2
@@ -2509,7 +2618,9 @@ defmodule ExICE.Priv.ICEAgent do
       end)
 
     {failed_keepalives, keepalives} =
-      Map.split_with(ice_agent.keepalives, fn {_, pair_id} -> pair_id in failed_pair_ids end)
+      Map.split_with(ice_agent.keepalives, fn {_, {pair_id, _sent_at}} ->
+        pair_id in failed_pair_ids
+      end)
 
     if failed_pair_ids != [] do
       Logger.debug("""
@@ -3100,7 +3211,7 @@ defmodule ExICE.Priv.ICEAgent do
   end
 
   defp start_pair_timer() do
-    Process.send_after(self(), :pair_timeout, div(@pair_timeout, 2))
+    Process.send_after(self(), :pair_timeout, @pair_check_interval)
   end
 
   defp start_eoc_timer(ice_agent) do
@@ -3168,7 +3279,7 @@ defmodule ExICE.Priv.ICEAgent do
       {:ok, ice_agent} ->
         pair = %{pair | requests_sent: pair.requests_sent + 1}
         ice_agent = put_in(ice_agent.checklist[pair.id], pair)
-        keepalives = Map.put(ice_agent.keepalives, req.transaction_id, pair.id)
+        keepalives = Map.put(ice_agent.keepalives, req.transaction_id, {pair.id, now()})
         %{ice_agent | keepalives: keepalives}
 
       {:error, ice_agent} ->
